@@ -28,6 +28,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import copy
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # experiment.py 在 SnapKV 目录下，直接把当前目录加入路径
@@ -139,9 +140,17 @@ def generate_with_monitoring(model, tokenizer, prompt, max_new_tokens=2048, devi
 
             # 检测是否是 </think>
             if next_token_id.item() == think_end_id and think_end_pos is None:
-                think_end_pos = prompt_len + step
-                kv_at_think_end = past_key_values  # 保存这一刻的 KV cache
+                think_end_pos = prompt_len + step + 1
+
+                # 必须 deepcopy，否则 DynamicCache 会继续被后续 generation 污染
+                kv_at_think_end = copy.deepcopy(past_key_values)
+
                 print(f"  [检测到 </think>] 位置: {think_end_pos}, think block 长度约 {step} tokens")
+                print(f"  KV cache 类型: {type(kv_at_think_end)}")
+
+                # 调试输出
+                if hasattr(kv_at_think_end, "layers"):
+                    print(f"  layers 数量: {len(kv_at_think_end.layers)}")
 
             # EOS 停止
             if next_token_id.item() == tokenizer.eos_token_id:
@@ -168,61 +177,121 @@ def generate_with_monitoring(model, tokenizer, prompt, max_new_tokens=2048, devi
 
 def normalize_kv_cache(kv_cache):
     """
-    终极自适应解析函数：无论 transformers 内部做了什么魔改，
-    强制从底层拆解出每一层的 k 和 v 张量。
+    强制兼容 transformers 所有 KV cache 格式
+    最终统一返回:
+
+        [(k,v), (k,v), ...]
+
     """
+
     import torch
-    def extract_kv_from_layer(layer):
-        # 1. 如果它是常规元组
-        if isinstance(layer, (list, tuple)) and len(layer) >= 2:
-            return layer[0], layer[1]
 
-        # 2. 如果它是新版 CacheLayer 对象，寻找它的各种可能属性名
-        for key_attr, val_attr in [
-            ("key_states", "value_states"),
-            ("keys", "values"),
-            ("key_cache", "value_cache"),
-            ("k", "v")
-        ]:
-            if hasattr(layer, key_attr) and hasattr(layer, val_attr):
-                k = getattr(layer, key_attr)
-                v = getattr(layer, val_attr)
-                if isinstance(k, torch.Tensor) and isinstance(v, torch.Tensor):
-                    return k, v
+    # ==========================================================
+    # 情况1: 新版 DynamicCache
+    # ==========================================================
+    if hasattr(kv_cache, "layers"):
 
-        # 3. 实在不行，通过反射直接翻找对象里所有的 Tensor 属性
-        tensors = [getattr(layer, attr) for attr in dir(layer)
-                   if not attr.startswith('_') and isinstance(getattr(layer, attr), torch.Tensor)]
-        if len(tensors) >= 2:
-            return tensors[0], tensors[1]
+        out = []
 
-        raise ValueError(f"无法从层级对象提取 KV Tensor: {type(layer)}")
+        for idx, layer in enumerate(kv_cache.layers):
 
-    # ================= 分支 1：如果是原生 Tuple =================
+            # 调试
+            print(f"[Layer {idx}] type = {type(layer)}")
+
+            # keys / values
+            if hasattr(layer, "keys") and hasattr(layer, "values"):
+
+                k = layer.keys
+                v = layer.values
+
+                print("  using keys/values")
+
+                out.append((k, v))
+                continue
+
+            # key_states / value_states
+            if hasattr(layer, "key_states") and hasattr(layer, "value_states"):
+
+                k = layer.key_states
+                v = layer.value_states
+
+                print("  using key_states/value_states")
+
+                out.append((k, v))
+                continue
+
+            # key_cache / value_cache
+            if hasattr(layer, "key_cache") and hasattr(layer, "value_cache"):
+
+                k = layer.key_cache
+                v = layer.value_cache
+
+                print("  using key_cache/value_cache")
+
+                out.append((k, v))
+                continue
+
+            # 暴力反射 tensor
+            tensor_attrs = []
+
+            for attr in dir(layer):
+
+                if attr.startswith("_"):
+                    continue
+
+                try:
+                    val = getattr(layer, attr)
+
+                    if isinstance(val, torch.Tensor):
+                        tensor_attrs.append((attr, val))
+
+                except:
+                    pass
+
+            print("  tensor attrs =", [x[0] for x in tensor_attrs])
+
+            if len(tensor_attrs) >= 2:
+
+                k = tensor_attrs[0][1]
+                v = tensor_attrs[1][1]
+
+                print(f"  fallback tensor attrs: {tensor_attrs[0][0]}, {tensor_attrs[1][0]}")
+
+                out.append((k, v))
+                continue
+
+            raise ValueError(f"无法解析 layer: {type(layer)}")
+
+        return out
+
+    # ==========================================================
+    # 情况2: 老 tuple
+    # ==========================================================
     if isinstance(kv_cache, tuple):
-        if len(kv_cache) == 2 and isinstance(kv_cache[0], tuple) and len(kv_cache[0]) > 2:
-            return list(zip(kv_cache[0], kv_cache[1]))
-        return list(kv_cache)
 
-    # ================= 分支 2：最新版 Transformers (拥有 layers 属性) =================
-    if hasattr(kv_cache, "layers") and isinstance(kv_cache.layers, (list, tuple)):
-        return [extract_kv_from_layer(layer) for layer in kv_cache.layers]
+        # ((k,v), ...)
+        if len(kv_cache) > 0 and isinstance(kv_cache[0], tuple):
 
-    # ================= 分支 3：中期版 Transformers (拥有 key_cache 列表) =================
-    if hasattr(kv_cache, "key_cache") and hasattr(kv_cache, "value_cache"):
-        return list(zip(kv_cache.key_cache, kv_cache.value_cache))
+            return [(x[0], x[1]) for x in kv_cache]
 
-    # ================= 分支 4：兜底强转迭代 =================
-    try:
-        res = list(kv_cache)
-        if len(res) == 2 and isinstance(res[0], (list, tuple)) and len(res[0]) > 2:
-            return list(zip(res[0], res[1]))
-        elif len(res) > 0:
-            return [extract_kv_from_layer(layer) for layer in res]
-    except Exception:
-        pass
+    # ==========================================================
+    # 情况3: key_cache/value_cache
+    # ==========================================================
+    if hasattr(kv_cache, "key_cache"):
 
-    raise ValueError(f"彻底无法解析当前的 KV Cache 格式: {type(kv_cache)}")
+        return list(zip(
+            kv_cache.key_cache,
+            kv_cache.value_cache
+        ))
+
+    # ==========================================================
+    # 实在不行
+    # ==========================================================
+    print("kv_cache dir =", dir(kv_cache))
+
+    raise ValueError(
+        f"彻底无法解析 KV cache: {type(kv_cache)}"
+    )
 
 
 def visualize_kv_attention(kv_cache, think_start, think_end, save_dir="heatmaps", problem_id=""):
