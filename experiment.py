@@ -166,27 +166,40 @@ def generate_with_monitoring(model, tokenizer, prompt, max_new_tokens=2048, devi
     return generated_ids, think_start_pos, think_end_pos, kv_at_think_end, past_key_values
 
 
+def normalize_kv_cache(kv_cache):
+    """
+    智能清洗函数：把各种版本的 KV Cache 统一转换成标准格式:
+    [(k_0, v_0), (k_1, v_1), ..., (k_31, v_31)]
+    """
+    # 1. 尝试使用官方转换器
+    if hasattr(kv_cache, "to_legacy_cache"):
+        legacy = kv_cache.to_legacy_cache()
+        if isinstance(legacy, tuple) and len(legacy) > 0:
+            if len(legacy[0]) == 2:  # 标准格式 ((k0, v0), (k1, v1)...)
+                return list(legacy)
+            elif len(legacy) == 2 and len(legacy[0]) > 2:  # ((k0...k31), (v0...v31))
+                return list(zip(legacy[0], legacy[1]))
+
+    # 2. 如果直接暴露出 key_cache 和 value_cache
+    if hasattr(kv_cache, "key_cache") and hasattr(kv_cache, "value_cache"):
+        return list(zip(kv_cache.key_cache, kv_cache.value_cache))
+
+    # 3. 强转判定
+    res = list(kv_cache)
+    if len(res) == 2 and isinstance(res[0], (list, tuple)) and len(res[0]) > 2:
+        # 就是这里解决你的报错：遇到 [ [k0..k31], [v0..v31] ]，将其用 zip 重新配对
+        return list(zip(res[0], res[1]))
+    elif len(res) > 0 and len(res[0]) == 2:
+        return res
+
+    raise ValueError(f"无法解析当前的 KV Cache 格式: {type(kv_cache)}")
+
+
 def visualize_kv_attention(kv_cache, think_start, think_end, save_dir="heatmaps", problem_id=""):
     os.makedirs(save_dir, exist_ok=True)
 
-    # ================= 终极暴力解包方案 =================
-    legacy_kv = []
-    try:
-        # 尝试通过迭代器强行转换为 Python 标准列表: [(k,v), (k,v), ...]
-        legacy_kv = list(kv_cache)
-    except Exception:
-        pass
-
-    # 如果强转失败或里面不是元组，启动降级兜底方案
-    if not legacy_kv or not isinstance(legacy_kv[0], tuple):
-        if hasattr(kv_cache, "to_legacy_cache"):
-            res = kv_cache.to_legacy_cache()
-            legacy_kv = list(res) if isinstance(res, tuple) else res
-        elif hasattr(kv_cache, "key_cache") and hasattr(kv_cache, "value_cache"):
-            legacy_kv = list(zip(kv_cache.key_cache, kv_cache.value_cache))
-        else:
-            legacy_kv = kv_cache
-    # ====================================================
+    # 【使用清洗函数】获取 100% 干净的标准格式
+    legacy_kv = normalize_kv_cache(kv_cache)
 
     num_layers = len(legacy_kv)
     layers_to_plot = [0, num_layers // 4, num_layers // 2, num_layers - 1]
@@ -196,7 +209,6 @@ def visualize_kv_attention(kv_cache, think_start, think_end, save_dir="heatmaps"
         axes = [axes]
 
     for plot_idx, layer_idx in enumerate(layers_to_plot):
-        # 此时的 legacy_kv 已经被打平成纯净的 Python List，绝对支持下标访问
         k, v = legacy_kv[layer_idx]
 
         # 用 key 向量的 L2 norm 作为 token 重要性代理
@@ -211,21 +223,21 @@ def visualize_kv_attention(kv_cache, think_start, think_end, save_dir="heatmaps"
         # 标注 think block 范围
         if think_start is not None and think_end is not None and think_end <= seq_len:
             think_start_c = min(think_start, seq_len - 1)
-            think_end_c = min(think_end, seq_len - 1)
+            think_end_c   = min(think_end, seq_len - 1)
 
             ax.axvspan(think_start_c, think_end_c, alpha=0.15, color='red', label='think block')
-            ax.axvline(x=think_start_c, color='red', linewidth=1.5, linestyle='--')
-            ax.axvline(x=think_end_c, color='darkred', linewidth=1.5, linestyle='--', label='</think>')
+            ax.axvline(x=think_start_c, color='red',    linewidth=1.5, linestyle='--')
+            ax.axvline(x=think_end_c,   color='darkred', linewidth=1.5, linestyle='--', label='</think>')
 
             # 标注中间80%（要被截断的部分）
             think_len = think_end_c - think_start_c
-            keep_n = int(think_len * 0.1)
+            keep_n    = int(think_len * 0.1)
             mid_start = think_start_c + keep_n
-            mid_end = think_end_c - keep_n
+            mid_end   = think_end_c - keep_n
             if mid_end > mid_start:
                 ax.axvspan(mid_start, mid_end, alpha=0.2, color='orange', label='中间80%(待截断)')
 
-        ax.set_title(f"Layer {layer_idx} - Key Norm Distribution (token 重要性代理)")
+        ax.set_title(f"Layer {layer_idx} - Key Norm Distribution")
         ax.set_xlabel("Token Position")
         ax.set_ylabel("Key L2 Norm (avg over heads)")
         ax.legend(fontsize=8)
@@ -256,23 +268,10 @@ def truncate_think_kv(past_key_values, think_start, think_end, keep_ratio=0.1):
     print(
         f"  [截断] think block {think_len} tokens → 保留头尾各 {keep_n}，截断中间 {removed} tokens ({removed / think_len * 100:.1f}%)")
 
-    # ================= 终极暴力解包方案 =================
-    try:
-        legacy_kv = list(past_key_values)
-    except Exception:
-        legacy_kv = []
-
-    if not legacy_kv or not isinstance(legacy_kv[0], tuple):
-        if hasattr(past_key_values, "to_legacy_cache"):
-            res = past_key_values.to_legacy_cache()
-            legacy_kv = list(res) if isinstance(res, tuple) else res
-        elif hasattr(past_key_values, "key_cache"):
-            legacy_kv = list(zip(past_key_values.key_cache, past_key_values.value_cache))
-        else:
-            legacy_kv = past_key_values
-    # ====================================================
-
+    # 【使用清洗函数】获取 100% 干净的标准格式
+    legacy_kv = normalize_kv_cache(past_key_values)
     new_kv = []
+
     for k, v in legacy_kv:
         # k/v shape: (batch, num_heads, seq_len, head_dim)
         before = k[:, :, :think_start, :]
@@ -291,7 +290,7 @@ def truncate_think_kv(past_key_values, think_start, think_end, keep_ratio=0.1):
 
     legacy_tuple = tuple(new_kv)
 
-    # 尝试将截断后的 KV Cache 还原回原对象类 (即使失败，Transformers 也接受普通 tuple)
+    # 将截断后的 KV Cache 还原回去，哪怕失败了底层也会接受标准 tuple
     if hasattr(past_key_values.__class__, "from_legacy_cache"):
         return past_key_values.__class__.from_legacy_cache(legacy_tuple)
 
