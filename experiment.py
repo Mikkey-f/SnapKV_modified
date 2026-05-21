@@ -385,14 +385,39 @@ def truncate_think_kv(past_key_values, think_start, think_end, keep_ratio=0.1):
 
     legacy_tuple = tuple(new_kv)
 
+    # ==========================================================
+    # 新版 transformers DynamicCache
+    # ==========================================================
     try:
-        # 新版 Transformers 一般都有此方法
-        if hasattr(past_key_values.__class__, "from_legacy_cache"):
-            return past_key_values.__class__.from_legacy_cache(legacy_tuple)
-    except Exception:
-        pass
 
-    # 如果以上转换失败，直接塞原生 tuple，绝大部分 transformers 在 forward 会自动转换
+        from transformers.cache_utils import DynamicCache
+
+        # 转回 DynamicCache
+        new_cache = DynamicCache.from_legacy_cache(legacy_tuple)
+
+        print("[KV] 已转换回 DynamicCache")
+
+        return new_cache
+
+    except Exception as e:
+
+        print("[KV] DynamicCache 转换失败:", e)
+
+    # ==========================================================
+    # fallback
+    # ==========================================================
+    try:
+
+        if hasattr(past_key_values.__class__, "from_legacy_cache"):
+            return past_key_values.__class__.from_legacy_cache(
+                legacy_tuple
+            )
+
+    except Exception as e:
+
+        print("[KV] from_legacy_cache 失败:", e)
+
+    # 最后兜底
     return legacy_tuple
 
 
