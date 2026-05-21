@@ -348,6 +348,101 @@ def visualize_kv_attention(kv_cache, think_start, think_end, save_dir="heatmaps"
     print(f"  [可视化] 热力图保存至: {save_path}")
     return save_path
 
+def visualize_attention_scores(
+    all_attn_scores,
+    think_start,
+    think_end,
+    save_path="attention_heatmap.png",
+):
+    """
+    可视化：
+    answer generation 时
+    对历史 token 的 attention
+
+    横轴:
+        context token position
+
+    纵轴:
+        answer generation step
+    """
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    num_steps = len(all_attn_scores)
+
+    if num_steps == 0:
+        print("[警告] 没有 attention 数据")
+        return
+
+    num_layers = len(all_attn_scores[0])
+
+    layers_to_plot = [
+        0,
+        num_layers // 4,
+        num_layers // 2,
+        num_layers - 1
+    ]
+
+    fig, axes = plt.subplots(
+        len(layers_to_plot),
+        1,
+        figsize=(16, 4 * len(layers_to_plot))
+    )
+
+    if len(layers_to_plot) == 1:
+        axes = [axes]
+
+    for idx, layer_idx in enumerate(layers_to_plot):
+
+        mat = []
+
+        for step_scores in all_attn_scores:
+
+            scores = step_scores[layer_idx].numpy()
+
+            mat.append(scores)
+
+        mat = np.array(mat)
+
+        ax = axes[idx]
+
+        im = ax.imshow(
+            mat,
+            aspect='auto',
+            interpolation='nearest',
+        )
+
+        # think block 边界
+        ax.axvline(
+            x=think_start,
+            color='red',
+            linestyle='--',
+            linewidth=1.5
+        )
+
+        ax.axvline(
+            x=think_end,
+            color='darkred',
+            linestyle='--',
+            linewidth=1.5
+        )
+
+        ax.set_title(f"Layer {layer_idx} Attention Heatmap")
+
+        ax.set_xlabel("Context Token Position")
+
+        ax.set_ylabel("Answer Generation Step")
+
+        plt.colorbar(im, ax=ax)
+
+    plt.tight_layout()
+
+    plt.savefig(save_path, dpi=200)
+
+    plt.close()
+
+    print(f"[保存] Attention Heatmap -> {save_path}")
 
 def truncate_think_kv(past_key_values, think_start, think_end, keep_ratio=0.1):
     if think_start is None or think_end is None:
@@ -413,31 +508,83 @@ def truncate_think_kv(past_key_values, think_start, think_end, keep_ratio=0.1):
         return legacy_tuple
 
 
-def continue_generation(model, tokenizer, last_token_id, past_key_values, max_new_tokens=512, device="cuda"):
+def continue_generation(
+    model,
+    tokenizer,
+    last_token_id,
+    past_key_values,
+    think_start,
+    think_end,
+    max_new_tokens=512,
+    device="cuda",
+):
     """
-    从截断后的 KV cache 继续生成答案。
-    last_token_id: 截断前最后生成的 token id
+    从截断后的 KV cache 继续生成答案
+    并记录 answer -> context attention
     """
+
     generated_ids = []
+
     next_input = torch.tensor([[last_token_id]], device=device)
 
+    # =========================================================
+    # 保存 attention
+    #
+    # all_attn_scores[step][layer]
+    # -> tensor(seq_len,)
+    # =========================================================
+    all_attn_scores = []
+
     with torch.no_grad():
+
         for step in range(max_new_tokens):
+
             outputs = model(
                 input_ids=next_input,
                 past_key_values=past_key_values,
                 use_cache=True,
                 return_dict=True,
+                output_attentions=True,   # <<< 新增
             )
+
             past_key_values = outputs.past_key_values
-            next_token_id   = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
+            # =====================================================
+            # attentions:
+            # tuple(num_layers)
+            #
+            # each:
+            # (batch, num_heads, q_len=1, kv_len)
+            # =====================================================
+
+            attentions = outputs.attentions
+
+            layer_scores = []
+
+            for layer_attn in attentions:
+
+                # shape:
+                # (num_heads, kv_len)
+                attn = layer_attn[0, :, 0, :]
+
+                # 平均所有 head
+                attn_mean = attn.mean(dim=0).float().cpu()
+
+                layer_scores.append(attn_mean)
+
+            all_attn_scores.append(layer_scores)
+
+            # greedy decode
+            next_token_id = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+
             generated_ids.append(next_token_id.item())
+
             next_input = next_token_id
 
             if next_token_id.item() == tokenizer.eos_token_id:
                 break
 
-    return generated_ids
+    return generated_ids, all_attn_scores
 
 
 def run_experiment(args):
@@ -516,15 +663,33 @@ def run_experiment(args):
 
             # 从 </think> token 继续生成
             think_end_token_id = tokenizer.encode("</think>", add_special_tokens=False)[-1]
-            truncated_gen_ids  = continue_generation(
-                model, tokenizer,
+            # truncated_gen_ids  = continue_generation(
+            #     model, tokenizer,
+            #     last_token_id=think_end_token_id,
+            #     past_key_values=truncated_kv,
+            #     max_new_tokens=512,
+            #     device=device,
+            # )
+            truncated_gen_ids, attn_scores = continue_generation(
+                model,
+                tokenizer,
                 last_token_id=think_end_token_id,
                 past_key_values=truncated_kv,
+                think_start=think_start,
+                think_end=think_end,
                 max_new_tokens=512,
                 device=device,
             )
             truncated_text = tokenizer.decode(truncated_gen_ids, skip_special_tokens=False)
-
+            # =====================================================
+            # Attention Heatmap
+            # =====================================================
+            visualize_attention_scores(
+                attn_scores,
+                think_start,
+                think_end,
+                save_path=f"heatmaps/{prob['id']}_attention.png"
+            )
             print(f"\n--- 截断后输出 ---\n{truncated_text[:500]}\n")
 
             # 简单评估：看答案里有没有标准答案的数字
