@@ -559,6 +559,10 @@ def continue_generation(
 
             attentions = outputs.attentions
 
+            if attentions is None:
+                print("[错误] attentions=None，当前 attention backend 不支持 output_attentions")
+                break
+
             layer_scores = []
 
             for layer_attn in attentions:
@@ -599,10 +603,10 @@ def run_experiment(args):
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
-        torch_dtype=torch.float16,        # 24G 显存用 fp16
-        device_map="auto",                # 自动分配显存，多卡也能用
+        torch_dtype=torch.float16,
+        device_map="auto",
         trust_remote_code=True,
-        # attn_implementation="flash_attention_2",  # 装了 flash-attn 的话取消注释
+        attn_implementation="eager",
     )
     model.eval()
     print("模型加载完成\n")
