@@ -158,7 +158,7 @@ def generate_with_monitoring(model, tokenizer, prompt, max_new_tokens=2048, devi
             past_key_values = outputs.past_key_values
             next_token_logits = outputs.logits[:, -1, :]
 
-    full_ids = torch.cat([input_ids[0], torch.tensor(generated_ids)], dim=0)
+    full_ids = torch.cat([input_ids[0].cpu(), torch.tensor(generated_ids)], dim=0)
 
     # 找 think block 边界
     think_start_pos, _ = find_think_boundaries(full_ids, tokenizer)
