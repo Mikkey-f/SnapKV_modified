@@ -167,22 +167,17 @@ def generate_with_monitoring(model, tokenizer, prompt, max_new_tokens=2048, devi
 
 
 def visualize_kv_attention(kv_cache, think_start, think_end, save_dir="heatmaps", problem_id=""):
-    """
-    从 KV cache 里提取 attention 分布并可视化。
-
-    核心思路：
-        KV cache 里存的是 key_states。
-        我们用 think block 结尾几个 token 的 query（近似用 key 代替）
-        对整个历史做 attention，看各位置的被关注程度。
-
-    注意：这是近似可视化，严格的做法需要在 forward 里 hook attention weights。
-    这里展示的是 key 向量的 L2 norm 分布，作为 token 重要性的代理指标，
-    实际跑的时候建议在 update_kv 里用 visualize=True 参数拿真实 attention weights。
-    """
     os.makedirs(save_dir, exist_ok=True)
 
-    # 取几个有代表性的层
-    num_layers = len(kv_cache)
+    # 【修改处】统一转换到 legacy tuple 格式以兼容所有 transformers 版本
+    if hasattr(kv_cache, "to_legacy_cache"):
+        legacy_kv = kv_cache.to_legacy_cache()
+    elif hasattr(kv_cache, "key_cache"):
+        legacy_kv = tuple(zip(kv_cache.key_cache, kv_cache.value_cache))
+    else:
+        legacy_kv = kv_cache
+
+    num_layers = len(legacy_kv)
     layers_to_plot = [0, num_layers // 4, num_layers // 2, num_layers - 1]
 
     fig, axes = plt.subplots(len(layers_to_plot), 1, figsize=(16, 4 * len(layers_to_plot)))
@@ -190,12 +185,11 @@ def visualize_kv_attention(kv_cache, think_start, think_end, save_dir="heatmaps"
         axes = [axes]
 
     for plot_idx, layer_idx in enumerate(layers_to_plot):
-        k, v = kv_cache[layer_idx]  # k shape: (batch, num_heads, seq_len, head_dim)
+        # 【修改处】直接从 legacy_kv 中安全获取
+        k, v = legacy_kv[layer_idx]
 
         # 用 key 向量的 L2 norm 作为 token 重要性代理
-        # 对所有 head 取平均
         key_norm = k[0].float().norm(dim=-1).mean(dim=0).cpu().numpy()  # (seq_len,)
-
         seq_len = len(key_norm)
         positions = np.arange(seq_len)
 
@@ -237,10 +231,6 @@ def visualize_kv_attention(kv_cache, think_start, think_end, save_dir="heatmaps"
 
 
 def truncate_think_kv(past_key_values, think_start, think_end, keep_ratio=0.1):
-    """
-    对 past_key_values 里每一层的 KV cache 做 think block 截断。
-    保留头部 keep_ratio + 尾部 keep_ratio，丢弃中间。
-    """
     if think_start is None or think_end is None:
         print("  [截断] 未找到 think block 边界，跳过截断")
         return past_key_values
@@ -250,28 +240,43 @@ def truncate_think_kv(past_key_values, think_start, think_end, keep_ratio=0.1):
         print(f"  [截断] think block 太短 ({think_len} tokens)，跳过截断")
         return past_key_values
 
-    keep_n  = max(1, int(think_len * keep_ratio))
+    keep_n = max(1, int(think_len * keep_ratio))
     removed = think_len - 2 * keep_n
-    print(f"  [截断] think block {think_len} tokens → 保留头尾各 {keep_n}，截断中间 {removed} tokens ({removed/think_len*100:.1f}%)")
+    print(
+        f"  [截断] think block {think_len} tokens → 保留头尾各 {keep_n}，截断中间 {removed} tokens ({removed / think_len * 100:.1f}%)")
+
+    # 【修改处】统一转换到 legacy tuple 格式
+    if hasattr(past_key_values, "to_legacy_cache"):
+        legacy_kv = past_key_values.to_legacy_cache()
+    elif hasattr(past_key_values, "key_cache"):
+        legacy_kv = tuple(zip(past_key_values.key_cache, past_key_values.value_cache))
+    else:
+        legacy_kv = past_key_values
 
     new_kv = []
-    for k, v in past_key_values:
-        # k shape: (batch, num_heads, seq_len, head_dim)
-        before   = k[:, :, :think_start, :]
-        head_    = k[:, :, think_start:think_start + keep_n, :]
-        tail_    = k[:, :, think_end - keep_n:think_end, :]
-        after    = k[:, :, think_end:, :]
-        new_k    = torch.cat([before, head_, tail_, after], dim=2)
+    for k, v in legacy_kv:
+        # k/v shape: (batch, num_heads, seq_len, head_dim)
+        before = k[:, :, :think_start, :]
+        head_ = k[:, :, think_start:think_start + keep_n, :]
+        tail_ = k[:, :, think_end - keep_n:think_end, :]
+        after = k[:, :, think_end:, :]
+        new_k = torch.cat([before, head_, tail_, after], dim=2)
 
         before_v = v[:, :, :think_start, :]
-        head_v   = v[:, :, think_start:think_start + keep_n, :]
-        tail_v   = v[:, :, think_end - keep_n:think_end, :]
-        after_v  = v[:, :, think_end:, :]
-        new_v    = torch.cat([before_v, head_v, tail_v, after_v], dim=2)
+        head_v = v[:, :, think_start:think_start + keep_n, :]
+        tail_v = v[:, :, think_end - keep_n:think_end, :]
+        after_v = v[:, :, think_end:, :]
+        new_v = torch.cat([before_v, head_v, tail_v, after_v], dim=2)
 
         new_kv.append((new_k, new_v))
 
-    return tuple(new_kv)
+    legacy_tuple = tuple(new_kv)
+
+    # 【修改处】将截断后的 KV Cache 还原回最新的 Cache 对象类
+    if hasattr(past_key_values.__class__, "from_legacy_cache"):
+        return past_key_values.__class__.from_legacy_cache(legacy_tuple)
+
+    return legacy_tuple
 
 
 def continue_generation(model, tokenizer, last_token_id, past_key_values, max_new_tokens=512, device="cuda"):
