@@ -385,40 +385,32 @@ def truncate_think_kv(past_key_values, think_start, think_end, keep_ratio=0.1):
 
     legacy_tuple = tuple(new_kv)
 
-    # ==========================================================
-    # 新版 transformers DynamicCache
-    # ==========================================================
+    # =========================================================
+    # 强制转回 DynamicCache
+    # transformers >= 4.44 必须这样
+    # =========================================================
     try:
-
         from transformers.cache_utils import DynamicCache
 
-        # 转回 DynamicCache
-        new_cache = DynamicCache.from_legacy_cache(legacy_tuple)
+        new_cache = DynamicCache()
 
-        print("[KV] 已转换回 DynamicCache")
+        for layer_idx, (k, v) in enumerate(legacy_tuple):
+            new_cache.update(
+                key_states=k,
+                value_states=v,
+                layer_idx=layer_idx,
+            )
 
         return new_cache
 
     except Exception as e:
+        print(f"[警告] DynamicCache 重建失败: {e}")
 
-        print("[KV] DynamicCache 转换失败:", e)
-
-    # ==========================================================
-    # fallback
-    # ==========================================================
-    try:
-
+        # fallback
         if hasattr(past_key_values.__class__, "from_legacy_cache"):
-            return past_key_values.__class__.from_legacy_cache(
-                legacy_tuple
-            )
+            return past_key_values.__class__.from_legacy_cache(legacy_tuple)
 
-    except Exception as e:
-
-        print("[KV] from_legacy_cache 失败:", e)
-
-    # 最后兜底
-    return legacy_tuple
+        return legacy_tuple
 
 
 def continue_generation(model, tokenizer, last_token_id, past_key_values, max_new_tokens=512, device="cuda"):
