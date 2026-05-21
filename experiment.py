@@ -403,7 +403,25 @@ def visualize_attention_scores(
 
             mat.append(scores)
 
-        mat = np.array(mat)
+        max_len = max(len(x) for x in mat)
+
+        padded = []
+
+        for x in mat:
+
+            if len(x) < max_len:
+                pad_width = max_len - len(x)
+
+                x = np.pad(
+                    x,
+                    (0, pad_width),
+                    mode='constant',
+                    constant_values=0,
+                )
+
+            padded.append(x)
+
+        mat = np.stack(padded, axis=0)
 
         ax = axes[idx]
 
