@@ -168,37 +168,67 @@ def generate_with_monitoring(model, tokenizer, prompt, max_new_tokens=2048, devi
 
 def normalize_kv_cache(kv_cache):
     """
-    智能清洗函数：把各种版本的 KV Cache 统一转换成标准格式:
-    [(k_0, v_0), (k_1, v_1), ..., (k_31, v_31)]
+    终极自适应解析函数：无论 transformers 内部做了什么魔改，
+    强制从底层拆解出每一层的 k 和 v 张量。
     """
-    # 1. 尝试使用官方转换器
-    if hasattr(kv_cache, "to_legacy_cache"):
-        legacy = kv_cache.to_legacy_cache()
-        if isinstance(legacy, tuple) and len(legacy) > 0:
-            if len(legacy[0]) == 2:  # 标准格式 ((k0, v0), (k1, v1)...)
-                return list(legacy)
-            elif len(legacy) == 2 and len(legacy[0]) > 2:  # ((k0...k31), (v0...v31))
-                return list(zip(legacy[0], legacy[1]))
+    import torch
+    def extract_kv_from_layer(layer):
+        # 1. 如果它是常规元组
+        if isinstance(layer, (list, tuple)) and len(layer) >= 2:
+            return layer[0], layer[1]
 
-    # 2. 如果直接暴露出 key_cache 和 value_cache
+        # 2. 如果它是新版 CacheLayer 对象，寻找它的各种可能属性名
+        for key_attr, val_attr in [
+            ("key_states", "value_states"),
+            ("keys", "values"),
+            ("key_cache", "value_cache"),
+            ("k", "v")
+        ]:
+            if hasattr(layer, key_attr) and hasattr(layer, val_attr):
+                k = getattr(layer, key_attr)
+                v = getattr(layer, val_attr)
+                if isinstance(k, torch.Tensor) and isinstance(v, torch.Tensor):
+                    return k, v
+
+        # 3. 实在不行，通过反射直接翻找对象里所有的 Tensor 属性
+        tensors = [getattr(layer, attr) for attr in dir(layer)
+                   if not attr.startswith('_') and isinstance(getattr(layer, attr), torch.Tensor)]
+        if len(tensors) >= 2:
+            return tensors[0], tensors[1]
+
+        raise ValueError(f"无法从层级对象提取 KV Tensor: {type(layer)}")
+
+    # ================= 分支 1：如果是原生 Tuple =================
+    if isinstance(kv_cache, tuple):
+        if len(kv_cache) == 2 and isinstance(kv_cache[0], tuple) and len(kv_cache[0]) > 2:
+            return list(zip(kv_cache[0], kv_cache[1]))
+        return list(kv_cache)
+
+    # ================= 分支 2：最新版 Transformers (拥有 layers 属性) =================
+    if hasattr(kv_cache, "layers") and isinstance(kv_cache.layers, (list, tuple)):
+        return [extract_kv_from_layer(layer) for layer in kv_cache.layers]
+
+    # ================= 分支 3：中期版 Transformers (拥有 key_cache 列表) =================
     if hasattr(kv_cache, "key_cache") and hasattr(kv_cache, "value_cache"):
         return list(zip(kv_cache.key_cache, kv_cache.value_cache))
 
-    # 3. 强转判定
-    res = list(kv_cache)
-    if len(res) == 2 and isinstance(res[0], (list, tuple)) and len(res[0]) > 2:
-        # 就是这里解决你的报错：遇到 [ [k0..k31], [v0..v31] ]，将其用 zip 重新配对
-        return list(zip(res[0], res[1]))
-    elif len(res) > 0 and len(res[0]) == 2:
-        return res
+    # ================= 分支 4：兜底强转迭代 =================
+    try:
+        res = list(kv_cache)
+        if len(res) == 2 and isinstance(res[0], (list, tuple)) and len(res[0]) > 2:
+            return list(zip(res[0], res[1]))
+        elif len(res) > 0:
+            return [extract_kv_from_layer(layer) for layer in res]
+    except Exception:
+        pass
 
-    raise ValueError(f"无法解析当前的 KV Cache 格式: {type(kv_cache)}")
+    raise ValueError(f"彻底无法解析当前的 KV Cache 格式: {type(kv_cache)}")
 
 
 def visualize_kv_attention(kv_cache, think_start, think_end, save_dir="heatmaps", problem_id=""):
     os.makedirs(save_dir, exist_ok=True)
 
-    # 【使用清洗函数】获取 100% 干净的标准格式
+    # 【这里直接使用终极清洗函数】
     legacy_kv = normalize_kv_cache(kv_cache)
 
     num_layers = len(legacy_kv)
@@ -211,7 +241,6 @@ def visualize_kv_attention(kv_cache, think_start, think_end, save_dir="heatmaps"
     for plot_idx, layer_idx in enumerate(layers_to_plot):
         k, v = legacy_kv[layer_idx]
 
-        # 用 key 向量的 L2 norm 作为 token 重要性代理
         key_norm = k[0].float().norm(dim=-1).mean(dim=0).cpu().numpy()  # (seq_len,)
         seq_len = len(key_norm)
         positions = np.arange(seq_len)
@@ -220,20 +249,18 @@ def visualize_kv_attention(kv_cache, think_start, think_end, save_dir="heatmaps"
         ax.plot(positions, key_norm, color='steelblue', linewidth=0.8, alpha=0.8)
         ax.fill_between(positions, key_norm, alpha=0.3, color='steelblue')
 
-        # 标注 think block 范围
         if think_start is not None and think_end is not None and think_end <= seq_len:
             think_start_c = min(think_start, seq_len - 1)
-            think_end_c   = min(think_end, seq_len - 1)
+            think_end_c = min(think_end, seq_len - 1)
 
             ax.axvspan(think_start_c, think_end_c, alpha=0.15, color='red', label='think block')
-            ax.axvline(x=think_start_c, color='red',    linewidth=1.5, linestyle='--')
-            ax.axvline(x=think_end_c,   color='darkred', linewidth=1.5, linestyle='--', label='</think>')
+            ax.axvline(x=think_start_c, color='red', linewidth=1.5, linestyle='--')
+            ax.axvline(x=think_end_c, color='darkred', linewidth=1.5, linestyle='--', label='</think>')
 
-            # 标注中间80%（要被截断的部分）
             think_len = think_end_c - think_start_c
-            keep_n    = int(think_len * 0.1)
+            keep_n = int(think_len * 0.1)
             mid_start = think_start_c + keep_n
-            mid_end   = think_end_c - keep_n
+            mid_end = think_end_c - keep_n
             if mid_end > mid_start:
                 ax.axvspan(mid_start, mid_end, alpha=0.2, color='orange', label='中间80%(待截断)')
 
@@ -268,7 +295,6 @@ def truncate_think_kv(past_key_values, think_start, think_end, keep_ratio=0.1):
     print(
         f"  [截断] think block {think_len} tokens → 保留头尾各 {keep_n}，截断中间 {removed} tokens ({removed / think_len * 100:.1f}%)")
 
-    # 【使用清洗函数】获取 100% 干净的标准格式
     legacy_kv = normalize_kv_cache(past_key_values)
     new_kv = []
 
@@ -290,10 +316,14 @@ def truncate_think_kv(past_key_values, think_start, think_end, keep_ratio=0.1):
 
     legacy_tuple = tuple(new_kv)
 
-    # 将截断后的 KV Cache 还原回去，哪怕失败了底层也会接受标准 tuple
-    if hasattr(past_key_values.__class__, "from_legacy_cache"):
-        return past_key_values.__class__.from_legacy_cache(legacy_tuple)
+    try:
+        # 新版 Transformers 一般都有此方法
+        if hasattr(past_key_values.__class__, "from_legacy_cache"):
+            return past_key_values.__class__.from_legacy_cache(legacy_tuple)
+    except Exception:
+        pass
 
+    # 如果以上转换失败，直接塞原生 tuple，绝大部分 transformers 在 forward 会自动转换
     return legacy_tuple
 
 
