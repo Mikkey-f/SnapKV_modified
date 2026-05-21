@@ -169,13 +169,24 @@ def generate_with_monitoring(model, tokenizer, prompt, max_new_tokens=2048, devi
 def visualize_kv_attention(kv_cache, think_start, think_end, save_dir="heatmaps", problem_id=""):
     os.makedirs(save_dir, exist_ok=True)
 
-    # 【修改处】统一转换到 legacy tuple 格式以兼容所有 transformers 版本
-    if hasattr(kv_cache, "to_legacy_cache"):
-        legacy_kv = kv_cache.to_legacy_cache()
-    elif hasattr(kv_cache, "key_cache"):
-        legacy_kv = tuple(zip(kv_cache.key_cache, kv_cache.value_cache))
-    else:
-        legacy_kv = kv_cache
+    # ================= 终极暴力解包方案 =================
+    legacy_kv = []
+    try:
+        # 尝试通过迭代器强行转换为 Python 标准列表: [(k,v), (k,v), ...]
+        legacy_kv = list(kv_cache)
+    except Exception:
+        pass
+
+    # 如果强转失败或里面不是元组，启动降级兜底方案
+    if not legacy_kv or not isinstance(legacy_kv[0], tuple):
+        if hasattr(kv_cache, "to_legacy_cache"):
+            res = kv_cache.to_legacy_cache()
+            legacy_kv = list(res) if isinstance(res, tuple) else res
+        elif hasattr(kv_cache, "key_cache") and hasattr(kv_cache, "value_cache"):
+            legacy_kv = list(zip(kv_cache.key_cache, kv_cache.value_cache))
+        else:
+            legacy_kv = kv_cache
+    # ====================================================
 
     num_layers = len(legacy_kv)
     layers_to_plot = [0, num_layers // 4, num_layers // 2, num_layers - 1]
@@ -185,7 +196,7 @@ def visualize_kv_attention(kv_cache, think_start, think_end, save_dir="heatmaps"
         axes = [axes]
 
     for plot_idx, layer_idx in enumerate(layers_to_plot):
-        # 【修改处】直接从 legacy_kv 中安全获取
+        # 此时的 legacy_kv 已经被打平成纯净的 Python List，绝对支持下标访问
         k, v = legacy_kv[layer_idx]
 
         # 用 key 向量的 L2 norm 作为 token 重要性代理
@@ -200,17 +211,17 @@ def visualize_kv_attention(kv_cache, think_start, think_end, save_dir="heatmaps"
         # 标注 think block 范围
         if think_start is not None and think_end is not None and think_end <= seq_len:
             think_start_c = min(think_start, seq_len - 1)
-            think_end_c   = min(think_end, seq_len - 1)
+            think_end_c = min(think_end, seq_len - 1)
 
             ax.axvspan(think_start_c, think_end_c, alpha=0.15, color='red', label='think block')
-            ax.axvline(x=think_start_c, color='red',    linewidth=1.5, linestyle='--')
-            ax.axvline(x=think_end_c,   color='darkred', linewidth=1.5, linestyle='--', label='</think>')
+            ax.axvline(x=think_start_c, color='red', linewidth=1.5, linestyle='--')
+            ax.axvline(x=think_end_c, color='darkred', linewidth=1.5, linestyle='--', label='</think>')
 
             # 标注中间80%（要被截断的部分）
             think_len = think_end_c - think_start_c
-            keep_n    = int(think_len * 0.1)
+            keep_n = int(think_len * 0.1)
             mid_start = think_start_c + keep_n
-            mid_end   = think_end_c - keep_n
+            mid_end = think_end_c - keep_n
             if mid_end > mid_start:
                 ax.axvspan(mid_start, mid_end, alpha=0.2, color='orange', label='中间80%(待截断)')
 
@@ -245,13 +256,21 @@ def truncate_think_kv(past_key_values, think_start, think_end, keep_ratio=0.1):
     print(
         f"  [截断] think block {think_len} tokens → 保留头尾各 {keep_n}，截断中间 {removed} tokens ({removed / think_len * 100:.1f}%)")
 
-    # 【修改处】统一转换到 legacy tuple 格式
-    if hasattr(past_key_values, "to_legacy_cache"):
-        legacy_kv = past_key_values.to_legacy_cache()
-    elif hasattr(past_key_values, "key_cache"):
-        legacy_kv = tuple(zip(past_key_values.key_cache, past_key_values.value_cache))
-    else:
-        legacy_kv = past_key_values
+    # ================= 终极暴力解包方案 =================
+    try:
+        legacy_kv = list(past_key_values)
+    except Exception:
+        legacy_kv = []
+
+    if not legacy_kv or not isinstance(legacy_kv[0], tuple):
+        if hasattr(past_key_values, "to_legacy_cache"):
+            res = past_key_values.to_legacy_cache()
+            legacy_kv = list(res) if isinstance(res, tuple) else res
+        elif hasattr(past_key_values, "key_cache"):
+            legacy_kv = list(zip(past_key_values.key_cache, past_key_values.value_cache))
+        else:
+            legacy_kv = past_key_values
+    # ====================================================
 
     new_kv = []
     for k, v in legacy_kv:
@@ -272,7 +291,7 @@ def truncate_think_kv(past_key_values, think_start, think_end, keep_ratio=0.1):
 
     legacy_tuple = tuple(new_kv)
 
-    # 【修改处】将截断后的 KV Cache 还原回最新的 Cache 对象类
+    # 尝试将截断后的 KV Cache 还原回原对象类 (即使失败，Transformers 也接受普通 tuple)
     if hasattr(past_key_values.__class__, "from_legacy_cache"):
         return past_key_values.__class__.from_legacy_cache(legacy_tuple)
 
