@@ -157,27 +157,64 @@ def kv_to_list(kv_cache):
     兼容:
         - 老版 tuple cache
         - 新版 DynamicCache
-        - HybridCache
+        - HF 4.45+
     """
 
     # ---------------------------------------------------
-    # 新版 DynamicCache
+    # DynamicCache
     # ---------------------------------------------------
     if isinstance(kv_cache, DynamicCache):
 
         kv_list = []
 
-        for layer_idx in range(len(kv_cache)):
+        # 新版 transformers
+        try:
 
-            k = kv_cache.key_cache[layer_idx]
-            v = kv_cache.value_cache[layer_idx]
+            for layer_idx in range(len(kv_cache)):
 
-            kv_list.append((k, v))
+                layer = kv_cache.layers[layer_idx]
 
-        return kv_list
+                k = layer.keys
+                v = layer.values
+
+                kv_list.append((k, v))
+
+            return kv_list
+
+        except Exception:
+            pass
+
+        # 中间版本 transformers
+        try:
+
+            for layer_idx in range(len(kv_cache)):
+
+                k, v = kv_cache[layer_idx]
+
+                kv_list.append((k, v))
+
+            return kv_list
+
+        except Exception:
+            pass
+
+        # 老版本 transformers
+        try:
+
+            for layer_idx in range(len(kv_cache)):
+
+                k = kv_cache.key_cache[layer_idx]
+                v = kv_cache.value_cache[layer_idx]
+
+                kv_list.append((k, v))
+
+            return kv_list
+
+        except Exception:
+            pass
 
     # ---------------------------------------------------
-    # tuple/list 格式
+    # tuple/list cache
     # ---------------------------------------------------
     if isinstance(kv_cache, (tuple, list)):
 
@@ -188,20 +225,17 @@ def kv_to_list(kv_cache):
             if isinstance(first, (tuple, list)) and len(first) == 2:
                 return [(x[0], x[1]) for x in kv_cache]
 
-    raise ValueError(f"Unknown KV type: {type(kv_cache)}")
+    raise ValueError(
+        f"Unknown KV type: {type(kv_cache)}"
+    )
 
 
 def list_to_dynamic_cache(kv_list):
 
     cache = DynamicCache()
 
-    for layer_idx, (k, v) in enumerate(kv_list):
-
-        cache.update(
-            key_states=k,
-            value_states=v,
-            layer_idx=layer_idx
-        )
+    for k, v in kv_list:
+        cache.append(k, v)
 
     return cache
 
