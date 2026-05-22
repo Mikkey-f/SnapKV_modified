@@ -352,6 +352,7 @@ def generate_full_reasoning(
 
                 print(f"Detected </think> at {think_end_pos}")
 
+
             if token_id == tokenizer.eos_token_id:
                 break
 
@@ -469,6 +470,10 @@ def compute_think_attention_scores(
                 # max-head pooling
                 attn = attn.max(dim=0).values
 
+                attn = attn / (
+                        attn.sum() + 1e-8
+                )
+
                 think_attn = attn[
                     think_start:think_end
                 ]
@@ -494,7 +499,9 @@ def compute_think_attention_scores(
 
 def sparse_select_kv(
     kv_cache,
-    keep_indices
+    keep_indices,
+    think_start,
+    think_end,
 ):
 
     kv_list = kv_to_list(kv_cache)
@@ -503,23 +510,72 @@ def sparse_select_kv(
         list(set(keep_indices))
     )
 
-    keep_indices = torch.tensor(
+    keep_tensor = torch.tensor(
         keep_indices,
         dtype=torch.long,
     )
+
+    # ---------------------------------------------------
+    # old position -> new position
+    # ---------------------------------------------------
+
+    position_map = {
+        old_idx: new_idx
+        for new_idx, old_idx
+        in enumerate(keep_indices)
+    }
+
+    # ---------------------------------------------------
+    # new think positions
+    # ---------------------------------------------------
+
+    kept_think_positions = [
+        position_map[i]
+        for i in range(think_start, think_end)
+        if i in position_map
+    ]
+
+    if len(kept_think_positions) == 0:
+
+        new_think_start = None
+        new_think_end = None
+
+    else:
+
+        new_think_start = min(
+            kept_think_positions
+        )
+
+        new_think_end = (
+            max(kept_think_positions) + 1
+        )
+
+    # ---------------------------------------------------
+    # slice KV
+    # ---------------------------------------------------
 
     new_kv = []
 
     for k, v in kv_list:
 
-        idx = keep_indices.to(k.device)
+        idx = keep_tensor.to(k.device)
 
         k_new = k[:, :, idx, :]
         v_new = v[:, :, idx, :]
 
         new_kv.append((k_new, v_new))
 
-    return list_to_dynamic_cache(new_kv)
+    compressed_kv = list_to_dynamic_cache(
+        new_kv
+    )
+
+    return {
+        "kv": compressed_kv,
+        "position_map": position_map,
+        "think_start": new_think_start,
+        "think_end": new_think_end,
+        "keep_indices": keep_indices,
+    }
 
 
 def hard_truncate_head_tail(
@@ -578,7 +634,9 @@ def hard_truncate_head_tail(
 
     return sparse_select_kv(
         kv_cache,
-        keep_indices
+        keep_indices,
+        think_start,
+        think_end,
     )
 
 
@@ -632,7 +690,9 @@ def attention_guided_eviction(
 
     return sparse_select_kv(
         kv_cache,
-        keep_indices
+        keep_indices,
+        think_start,
+        think_end,
     )
 
 
@@ -705,7 +765,17 @@ def continue_generation(
 
                 row = torch.stack(
                     layer_rows
-                ).mean(dim=0).numpy()
+                ).mean(dim=0)
+
+                # ---------------------------------------------------
+                # normalize
+                # ---------------------------------------------------
+
+                row = row / (
+                        row.sum() + 1e-8
+                )
+
+                row = row.numpy()
 
                 if kv_len_start is None:
                     kv_len_start = len(row)
@@ -990,7 +1060,7 @@ def run_visualization(
 
         if args.method == "hard":
 
-            compressed_kv = hard_truncate_head_tail(
+            compress_out = hard_truncate_head_tail(
                 out["kv_at_think_end"],
                 think_start,
                 think_end,
@@ -999,13 +1069,18 @@ def run_visualization(
 
         else:
 
-            compressed_kv = attention_guided_eviction(
+            compress_out = attention_guided_eviction(
                 out["kv_at_think_end"],
                 think_start,
                 think_end,
                 scores,
                 keep_ratio=args.keep_ratio,
             )
+
+        compressed_kv = compress_out["kv"]
+
+        new_think_start = compress_out["think_start"]
+        new_think_end = compress_out["think_end"]
 
         _, attn_matrix = continue_generation(
             model,
@@ -1020,15 +1095,15 @@ def run_visualization(
 
         plot_heatmap(
             attn_matrix,
-            think_start,
-            think_end,
+            new_think_start,
+            new_think_end,
             f"heatmaps/{prob['id']}_heatmap.png"
         )
 
         plot_curve(
             attn_matrix,
-            think_start,
-            think_end,
+            new_think_start,
+            new_think_end,
             f"heatmaps/{prob['id']}_curve.png"
         )
 
@@ -1121,7 +1196,7 @@ def run_eval(
 
         if args.method == "hard":
 
-            compressed_kv = hard_truncate_head_tail(
+            compress_out = hard_truncate_head_tail(
                 out["kv_at_think_end"],
                 think_start,
                 think_end,
@@ -1130,13 +1205,15 @@ def run_eval(
 
         else:
 
-            compressed_kv = attention_guided_eviction(
+            compress_out = attention_guided_eviction(
                 out["kv_at_think_end"],
                 think_start,
                 think_end,
                 scores,
                 keep_ratio=args.keep_ratio,
             )
+
+        compressed_kv = compress_out["kv"]
 
         trunc_ids, _ = continue_generation(
             model,
