@@ -632,7 +632,8 @@ def run_experiment(args):
     os.makedirs("results", exist_ok=True)
     os.makedirs("heatmaps", exist_ok=True)
 
-    for prob in TEST_PROBLEMS:
+    # for prob in TEST_PROBLEMS:
+    for prob in gsm8k dataset:
         print(f"\n{'='*60}")
         print(f"问题: {prob['id']} - {prob['question'][:50]}...")
         print(f"标准答案: {prob['answer']}")
