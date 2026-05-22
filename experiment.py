@@ -231,13 +231,36 @@ def kv_to_list(kv_cache):
 
 
 def list_to_dynamic_cache(kv_list):
-
     cache = DynamicCache()
 
-    for k, v in kv_list:
-        cache.append(k, v)
+    # 新版 transformers: key_cache / value_cache 直接赋值
+    try:
+        for layer_idx, (k, v) in enumerate(kv_list):
+            cache.key_cache.append(k)
+            cache.value_cache.append(v)
+        return cache
+    except Exception:
+        pass
 
-    return cache
+    # 中间版本: update(key, value, layer_idx)
+    try:
+        cache2 = DynamicCache()
+        for layer_idx, (k, v) in enumerate(kv_list):
+            cache2.update(k, v, layer_idx)
+        return cache2
+    except Exception:
+        pass
+
+    # 老版本: append(k, v)
+    try:
+        cache3 = DynamicCache()
+        for k, v in kv_list:
+            cache3.append(k, v)
+        return cache3
+    except Exception:
+        pass
+
+    raise RuntimeError("list_to_dynamic_cache: no compatible DynamicCache API found")
 
 
 def get_cache_length(kv_cache):
