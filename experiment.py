@@ -28,7 +28,7 @@ python experiment_v3.py \
     --num_samples 50
 
 # 两个都跑
-python experiment_v3.py \
+python experiment.py \
     --mode both \
     --model_path /root/autodl-tmp/models/DeepSeek-R1-8B
 
@@ -150,18 +150,43 @@ def get_special_token_ids(tokenizer):
 
 
 def kv_to_list(kv_cache):
+    """
+    统一把 KV cache 转成:
+        List[(k, v)]
 
-    if hasattr(kv_cache, "key_cache"):
+    兼容:
+        - 老版 tuple cache
+        - 新版 DynamicCache
+        - HybridCache
+    """
 
-        return list(zip(
-            kv_cache.key_cache,
-            kv_cache.value_cache
-        ))
+    # ---------------------------------------------------
+    # 新版 DynamicCache
+    # ---------------------------------------------------
+    if isinstance(kv_cache, DynamicCache):
 
+        kv_list = []
+
+        for layer_idx in range(len(kv_cache)):
+
+            k = kv_cache.key_cache[layer_idx]
+            v = kv_cache.value_cache[layer_idx]
+
+            kv_list.append((k, v))
+
+        return kv_list
+
+    # ---------------------------------------------------
+    # tuple/list 格式
+    # ---------------------------------------------------
     if isinstance(kv_cache, (tuple, list)):
 
         if len(kv_cache) > 0:
-            return [(x[0], x[1]) for x in kv_cache]
+
+            first = kv_cache[0]
+
+            if isinstance(first, (tuple, list)) and len(first) == 2:
+                return [(x[0], x[1]) for x in kv_cache]
 
     raise ValueError(f"Unknown KV type: {type(kv_cache)}")
 
@@ -260,9 +285,13 @@ def generate_full_reasoning(
 
                 think_end_pos = prompt_len + len(generated)
 
-                kv_at_think_end = copy.deepcopy(
-                    past_key_values
-                )
+                kv_at_think_end = list_to_dynamic_cache([
+                    (
+                        k.clone(),
+                        v.clone()
+                    )
+                    for k, v in kv_to_list(past_key_values)
+                ])
 
                 print(f"Detected </think> at {think_end_pos}")
 
